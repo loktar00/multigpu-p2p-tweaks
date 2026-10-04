@@ -1,0 +1,11 @@
+[Unit]
+Description=GPU temperature guard (lowers a card's power limit when hotspot or VRAM is too hot)
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/sbin/gpu-temp-guard
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
