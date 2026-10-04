@@ -105,7 +105,7 @@ Add to the server's environment (systemd unit, launcher script, or proxy config)
 `--disable-custom-all-reduce` from its arguments:
 
     PYTHONPATH=/opt/vllm-force-ca            # prepend if PYTHONPATH is already set
-    CA_MAX_BYTES=<hidden_size * 2>           # 8192 for hidden size 4096
+    CA_MAX_BYTES=<hidden_size * 2>           # 8192 for hidden size 4096; keep 8192 with spec decode
     NCCL_P2P_LEVEL=SYS
 
 Remove `expandable_segments:True` from `PYTORCH_CUDA_ALLOC_CONF` if present. With it the server
@@ -118,7 +118,10 @@ Verify:
 - Server log does not contain `Custom allreduce is disabled`.
 - Send the same prompts at temperature 0 with and without the overlay; outputs must match or be
   equally coherent. Compare single-stream decode t/s and prefill t/s against the old setup;
-  if prefill dropped, lower `CA_MAX_BYTES`.
+  if prefill dropped, lower `CA_MAX_BYTES`. Never raise it to cover speculative-decoding verify
+  steps (16-80 KB): that measured 16-22% slower.
+- Compare the KV cache size line in the server log before and after; with `expandable_segments`
+  off it is usually larger, which allows a larger `--max-model-len`.
 
 Rollback: remove `/opt/vllm-force-ca` from `PYTHONPATH`, unset `CA_MAX_BYTES`, restart the
 server. Optionally add back `--disable-custom-all-reduce`.
@@ -163,3 +166,76 @@ Rollback:
        /etc/logrotate.d/gpu-temp-guard /etc/default/gpu-temp-guard
     rm -rf /var/lib/gpu-temp-guard
     systemctl daemon-reload
+
+## Component 4: MiMo-V2 three-module MTP (mimo-mtp3/)
+
+What it does: a `sitecustomize.py` that makes vLLM build all three MiMo-V2 MTP modules
+(vLLM hard-codes one) and feed each the target model's hidden state.
+
+Prerequisites and checks (same interpreter as the server):
+
+    V=$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')
+    grep -n "_MIMO_V2_FLASH_NUM_MTP_LAYERS\|class MiMoV2MTPLayer\|class _MiMoV2MTPLayers" $V/model_executor/models/mimo_v2_mtp.py
+    grep -n "isinstance(ret_hidden_states, tuple)" $V/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+    grep -n "use_local_argmax_reduction" $V/config/speculative.py
+
+All must match. MiMo-V2 must already serve on this vLLM with MTP k=1 (it needs upstream PRs
+#57508 and #57784). If it does not, stop and report.
+
+Install:
+
+    mkdir -p /opt/vllm-mimo-mtp3
+    cp mimo-mtp3/sitecustomize.py /opt/vllm-mimo-mtp3/
+
+In the server environment put `/opt/vllm-mimo-mtp3` first on `PYTHONPATH` (before
+`/opt/vllm-force-ca` if that is used) and set the speculative config to:
+
+    --speculative-config '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
+
+If the server no longer starts because the KV cache is too small, add component 2 with
+`CA_MAX_BYTES=8192` and remove `expandable_segments:True`; only then lower `--max-model-len`.
+
+Verify:
+
+- Log contains `[mimo-mtp3] MTP modules: 3, feedback: target`.
+- Spec-decode metrics (`/metrics`, `vllm:spec_decode_num_accepted_tokens_per_pos`) show
+  acceptance at positions 1 and 2 well above 0.1 (about 0.68 and 0.54 measured).
+- Same prompts at temperature 0: answers coherent and equivalent to the k=1 server; single-stream
+  decode t/s higher than before.
+
+Rollback: remove `/opt/vllm-mimo-mtp3` from `PYTHONPATH`, set `num_speculative_tokens` back to 1,
+restart the server.
+
+## Component 5: fp8 KV for GLM-5.3-Flash on vllm-backport (glm-sparse-mla-fp8kv/)
+
+What it does: a patch to wtdcode/vllm-backport (4 Python/Triton files) that lets the
+TRITON_MLA_SPARSE backend use `--kv-cache-dtype fp8_e5m2`, plus the env var
+`VLLM_INDEXER_PREFILL_BUFFER_FACTOR`.
+
+Prerequisites and checks:
+
+    cd <backport tree> && git log -1 --format=%H    # tested: cde54e8ed390aef9e7d0670474365ae033b38a40
+    git status --short                              # note any local changes
+    git apply --check /path/to/glm-sparse-mla-fp8kv/fp8kv.patch
+
+If `--check` fails, stop and report. The tree must already serve GLM-5.3-Flash with a bf16 KV
+cache. Never patch the tree a running server uses.
+
+Install (on a copy; no rebuild needed):
+
+    cp -a <backport tree> <backport tree>-fp8kv
+    cd <backport tree>-fp8kv && git apply /path/to/glm-sparse-mla-fp8kv/fp8kv.patch
+
+Server changes: `PYTHONPATH` points at the copy, add `--kv-cache-dtype fp8_e5m2` and
+`VLLM_INDEXER_PREFILL_BUFFER_FACTOR=8` (never below 8), then raise `--max-model-len` step by step
+(159,744 fit on 8x 24 GB with component 2 loaded and expandable_segments off).
+
+Verify:
+
+- Server starts; log shows the fp8_e5m2 KV cache and a KV size covering `--max-model-len`.
+- Needle test: a fact placed mid-way in a prompt near the maximum length is retrieved.
+- Same short prompts at temperature 0 against the bf16 server: answers equivalent. Decode t/s
+  within a few percent of bf16.
+
+Rollback: point `PYTHONPATH` back at the unpatched tree, drop `--kv-cache-dtype` and the env var,
+restore the old `--max-model-len`, restart.
