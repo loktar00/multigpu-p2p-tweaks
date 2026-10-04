@@ -22,6 +22,27 @@ Measured on 8x RTX 3090 (TP8, x16 and x4 links, 4 NVLink pairs, P2P driver,
 Dropping `expandable_segments` (required, see below) also freed enough memory to raise the
 context from 57,344 to 65,536 tokens.
 
+It only wins at about 8 KB, i.e. one decoding sequence without speculative decoding. Every
+MTP/DFlash verify step all-reduces 16-80 KB, and pushing those through the custom kernel lost
+16-22% decode on the same box (MiMo-V2.6-Flash MTP: 199 -> 155 t/s at a 16 KB cap; Qwen3.8-Flash-Next
+MTP k=4: -19% at 32 KB; a 27B DFlash TP4 lane: -16% at 96 KB). Keep `CA_MAX_BYTES=8192`.
+With a spec-decode model the kernel then sits idle, which is fine, because of the next point.
+
+## Side effect: more KV cache
+
+With the overlay loaded and `expandable_segments` off, vLLM ends up with more memory for KV
+cache. Measured per 24 GB card:
+
+| | before | after | window |
+|---|---|---|---|
+| MiMo-V2.6-Flash TP8, MTP k=1 | 1.26 GiB | 1.51 GiB | 196,608 -> 262,144 |
+| MiMo-V2.6-Flash TP8, MTP k=3 (`../mimo-mtp3/`) | 0.99 GiB | 1.24 GiB | back to 196,608 |
+| Qwen3.8-Flash-Next FP8 TP8 | 2.90 GiB | 3.68 GiB | 196,608 -> 262,144 |
+
+On Flash-Next `expandable_segments` off alone did it. On MiMo, turning it off without the
+overlay only reached 1.31 GiB and 262,144 refused to start. Decode speed was unchanged in all
+three, and needle tests passed at the new maximum.
+
 ## Use
 
 Copy `sitecustomize.py` into a directory of its own and put that directory first on the
@@ -43,6 +64,9 @@ and no "Custom allreduce is disabled" warning. If you still see "your platform l
 capability or P2P test failed", P2P isn't working between some pair; fix that first.
 
 To undo, take the directory off `PYTHONPATH` (or put `--disable-custom-all-reduce` back).
+
+It runs the next `sitecustomize.py` found after its own directory on `PYTHONPATH`, so overlays
+stack: `PYTHONPATH=/opt/vllm-mimo-mtp3:/opt/vllm-force-ca`.
 
 ## Settings that matter
 
@@ -79,7 +103,7 @@ warning and patches nothing.
 
 - Run and measured on [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport)
   v0.13.1 (commit cde54e8), the tree the numbers above come from.
-- Loads and applies (import check only, no serving run) on vLLM 0.28.1rc1.dev78
-  (commit 696cdcb).
+- Served on vLLM 0.28.1rc1.dev78 (commit 696cdcb) with MiMo-V2.6-Flash and
+  Qwen3.8-Flash-Next (the numbers in the two sections above).
 - The patched functions exist with the same shape in upstream v0.10.0, v0.11.0 and `main`
   as of 2026-10. Not run there.

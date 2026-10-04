@@ -26,19 +26,21 @@ def _log(msg):
     print("[force-ca] " + msg, file=sys.stderr, flush=True)
 
 
-def _run_shadowed_sitecustomize():
-    # Python only imports the first sitecustomize on sys.path. Run the one this file hides
-    # (Debian/Ubuntu ship one) so its behaviour is kept.
-    for d in sys.path:
-        if not d or os.path.abspath(d) == _HERE:
-            continue
-        path = os.path.join(d, "sitecustomize.py")
+def _run_next_sitecustomize():
+    # Python only imports the first sitecustomize on sys.path. Run the next one after this
+    # directory (another overlay, or the one Debian/Ubuntu ship) so overlays can be stacked:
+    # PYTHONPATH=/opt/overlay-a:/opt/overlay-b
+    dirs = [os.path.abspath(d or os.curdir) for d in sys.path]
+    if _HERE not in dirs:
+        return
+    for i in range(dirs.index(_HERE) + 1, len(dirs)):
+        path = os.path.join(dirs[i], "sitecustomize.py")
         if os.path.isfile(path):
             try:
-                spec = importlib.util.spec_from_file_location("_shadowed_sitecustomize", path)
+                spec = importlib.util.spec_from_file_location("_sitecustomize_%d" % i, path)
                 spec.loader.exec_module(importlib.util.module_from_spec(spec))
             except Exception as e:
-                _log("shadowed %s raised %s: %s" % (path, type(e).__name__, e))
+                _log("%s raised %s: %s" % (path, type(e).__name__, e))
             return
 
 
@@ -94,5 +96,5 @@ class _PatchOnImport(importlib.abc.MetaPathFinder):
         return spec
 
 
-_run_shadowed_sitecustomize()
+_run_next_sitecustomize()
 sys.meta_path.insert(0, _PatchOnImport())
