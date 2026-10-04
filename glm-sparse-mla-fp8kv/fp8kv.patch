@@ -1,0 +1,163 @@
+fp8_e5m2 KV cache for the TRITON_MLA_SPARSE attention backend (GLM-5.3-Flash on Ampere), plus
+VLLM_INDEXER_PREFILL_BUFFER_FACTOR. Against wtdcode/vllm-backport, commit
+cde54e8ed390aef9e7d0670474365ae033b38a40 (also applies to master 29e66dad4).
+Apply from the top of the tree: git apply fp8kv.patch
+
+The patched files are part of vLLM / vllm-backport (Apache-2.0, Copyright the vLLM authors);
+this patch is under the same license.
+
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 735f8f4..63c87d8 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -833,7 +833,17 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+     # within the flashmla_sparse workspace.
+     # For DeepSeek-V3.2, the max_model_len is 163840.
+     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * 40
++    # VLLM_INDEXER_PREFILL_BUFFER_FACTOR (default 40 = unchanged) lowers it
++    # for models whose indexer cache is pooled (GLM-5.3-Flash: index_kpool = 4,
++    # so one request needs at most max_model_len / 4 entries; the 40x reservation
++    # costs ~0.5 GiB/card of KV pool at 131k on 24 GB cards).
++    # _split_indexer_prefill_chunks keeps multi-request chunks within this size.
++    # Keep factor * max_model_len * 132 B >= the fused-MoE buffers that share this
++    # workspace (128 MiB on GLM-5.3-Flash TP8): smaller makes the MoE resize it,
++    # which MEASURED cost 0.17 GiB of pool (factor 2: 0.63 GiB, factor 8: 1.0).
++    import os
++    factor = int(os.environ.get("VLLM_INDEXER_PREFILL_BUFFER_FACTOR", "40"))
++    return max_model_len * factor
+ 
+ 
+ def _supports_varlen_paged_mqa_logits() -> bool:
+diff --git a/vllm/v1/attention/backends/mla/triton_mla_sparse.py b/vllm/v1/attention/backends/mla/triton_mla_sparse.py
+index 83c0400..6da179a 100644
+--- a/vllm/v1/attention/backends/mla/triton_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/triton_mla_sparse.py
+@@ -6,6 +6,7 @@ from typing import ClassVar
+ 
+ import torch
+ 
++from vllm.config.cache import CacheDType
+ from vllm.utils.platform_utils import num_compute_units
+ from vllm.v1.attention.backend import (
+     AttentionCGSupport,
+@@ -31,7 +32,15 @@ class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
+ 
+ class TritonMLASparseImpl(XPUMLASparseImpl):
+     """Triton sparse-MLA impl with split-KV decode (3-7× faster than the
+-    single-pass XPU base for single-query decode on SM80 / SM121)."""
++    single-pass XPU base for single-query decode on SM80 / SM121).
++
++    fp8_e5m2 KV: concat_and_cache_mla stores the latent as e5m2 (k_scale is
++    1.0: e5m2 needs no calibrated scale, and _init_kv_cache_quant refuses
++    e5m2 for checkpoints that ship KV scales); the kernel up-casts to bf16
++    on load. e4m3 is impossible on SM80/86: Triton cannot load fp8e4nv there.
++    """
++
++    supported_quantized_kv_dtypes: ClassVar[tuple[str, ...]] = ("fp8_e5m2",)
+ 
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+@@ -49,7 +58,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
+         topk = self.topk_indices_buffer.shape[-1]
+         dim_qk = self.head_size
+         q = torch.empty(1, self.num_heads, dim_qk, dtype=torch.bfloat16, device=device)
+-        kv = torch.empty(64, 1, dim_qk, dtype=torch.bfloat16, device=device)
++        kv = torch.zeros(64, 1, dim_qk, dtype=self._kv_torch_dtype(), device=device)
+         indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
+         for splits in KV_SPLITS_CANDIDATES:
+             triton_mla_sparse_attention(
+@@ -61,6 +70,11 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
+                 sm_count=self._sm_count,
+             )
+ 
++    def _kv_torch_dtype(self) -> torch.dtype:
++        if self.kv_cache_dtype == "fp8_e5m2":
++            return torch.float8_e5m2
++        return torch.bfloat16
++
+     def _forward_bf16_kv(
+         self,
+         q: torch.Tensor,  # [sq, heads, d_qk]
+@@ -72,6 +86,11 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
+         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
+             -1, 1, kv_c_and_k_pe_cache.shape[-1]
+         )
++        if self.kv_cache_dtype == "fp8_e5m2":
++            # The cache is allocated as uint8 and MLAAttention.forward_impl
++            # re-views it as current_platform.fp8_dtype() (e4m3fn); the bytes
++            # are e5m2 (written by concat_and_cache_mla), so re-view them.
++            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(torch.float8_e5m2)
+         topk_indices = topk_indices.view(num_tokens, 1, -1)
+         output = triton_mla_sparse_attention(
+             q,
+@@ -86,6 +105,14 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
+ class TritonMLASparseBackend(XPUMLASparseBackend):
+     """Same bf16 sparse-MLA contract as the XPU backend, CUDA Triton kernels."""
+ 
++    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
++        "auto",
++        "float16",
++        "bfloat16",
++        # Stored as e5m2, up-cast to bf16 in the kernel (see the impl).
++        "fp8_e5m2",
++    ]
++
+     @staticmethod
+     def get_name() -> str:
+         return "TRITON_MLA_SPARSE"
+diff --git a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+index c8a8222..ecf8d5a 100644
+--- a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+@@ -185,6 +185,9 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
+ 
+ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
+     is_sparse = True
++    # Quantized KV dtypes this impl's kernels can read; the XPU kernels read
++    # bf16 only. TritonMLASparseImpl adds fp8_e5m2.
++    supported_quantized_kv_dtypes: ClassVar[tuple[str, ...]] = ()
+ 
+     def __init__(
+         self,
+@@ -251,8 +254,13 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
+         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
+         # MQA 576/512 approach for both prefill and decode
+ 
+-        if is_quantized_kv_cache(self.kv_cache_dtype):
+-            raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
++        if (
++            is_quantized_kv_cache(self.kv_cache_dtype)
++            and self.kv_cache_dtype not in self.supported_quantized_kv_dtypes
++        ):
++            raise NotImplementedError(
++                f"{self.kv_cache_dtype} kv is not supported with {type(self).__name__}"
++            )
+ 
+         # Concatenate q if it's a tuple (ql_nope, q_pe)
+         if isinstance(q, tuple):
+diff --git a/vllm/v1/attention/ops/triton_mla_sparse_kernel.py b/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
+index 4119772..be59bfe 100644
+--- a/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
++++ b/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
+@@ -153,7 +153,9 @@ def _sparse_mla_compute_tile(
+         re_scale = tl.exp2(e_max - n_e_max)
+         p = tl.exp2(qk - n_e_max[:, None])
+         acc *= re_scale[:, None]
+-        acc += tl.dot(p.to(v.dtype), v)
++        # An fp8 (e5m2) cache is up-cast to the query dtype on load; P stays
++        # bf16. For a bf16 cache both casts are no-ops.
++        acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
+         e_sum = e_sum * re_scale + tl.sum(p, 1)
+         e_max = n_e_max
+ 
+@@ -439,7 +441,8 @@ def triton_mla_sparse_attention(
+ 
+     Args:
+         q:         [num_tokens, num_heads_q, dim_qk] bf16
+-        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16
++        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16, or float8_e5m2
++                   (scale 1.0, up-cast to bf16 inside the kernel)
+         indices:   [num_tokens, num_heads_kv=1, topk] int32
+         sm_scale:  softmax scale
+         num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
