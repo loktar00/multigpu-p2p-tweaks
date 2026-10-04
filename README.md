@@ -7,7 +7,7 @@ stands on its own.
 
 [![MiMo-V2.6-Flash: 211 -> 253 tok/s on 8x RTX 3090](assets/mimo-mtp3-speed-poster.jpg)](assets/mimo-mtp3-speed.mp4)
 
-The mimo-mtp3 result as a 40 second film (click the poster to play the mp4).
+The mimo-mtp3 result as a 45 second film (click the poster to play the mp4).
 
 `vllm-custom-allreduce/` forces vLLM's custom all-reduce on more than two PCIe GPUs when P2P
 works. Single-stream decode on GLM-5.3-Flash TP8 went from 68.5 to 86.5 t/s. With
