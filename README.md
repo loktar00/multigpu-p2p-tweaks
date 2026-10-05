@@ -26,8 +26,6 @@ or VRAM runs too hot and gives it back once it cools.
 `driver/` has setup notes for the community P2P driver on same-generation consumer cards and
 a script to check peer access and measure copy bandwidth.
 
-Mixed Ampere + Blackwell box: [p2p-mixed-arch-fix](https://github.com/loktar00/p2p-mixed-arch-fix).
-
 Test box: 8x RTX 3090 (four NVLink pairs, mix of x16 and x4 slots), NVIDIA 595.58.03,
 Linux 6.17. Numbers in each README are from that box.
 

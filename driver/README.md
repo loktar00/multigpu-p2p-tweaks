@@ -9,8 +9,7 @@ and pick the branch that matches your installed driver version exactly (`<versio
 Its README covers the build. This page is what we learned running it on 8x RTX 3090
 (595.58.03-p2p, commit 6dd6ba3).
 
-Mixing Ampere and Blackwell in one box? The fork breaks CUDA init there; see
-[p2p-mixed-arch-fix](https://github.com/loktar00/p2p-mixed-arch-fix).
+Mixing Ampere and Blackwell in one box? The fork breaks CUDA init there; don't use it.
 
 ## Before you start
 

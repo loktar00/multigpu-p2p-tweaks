@@ -15,7 +15,7 @@ as root unless noted. Do one component at a time and verify it before starting t
   to the driver source.
 - This repo is for boxes where all P2P cards are the same architecture. If `nvidia-smi -L`
   shows both Ampere (RTX 30xx, A-series) and Blackwell (RTX 50xx, RTX PRO Blackwell) cards,
-  stop: use https://github.com/loktar00/p2p-mixed-arch-fix instead.
+  stop: the driver fork breaks CUDA init on mixed-architecture boxes. Do not install it.
 
 ## Component 1: P2P driver (driver/)
 
