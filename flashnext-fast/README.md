@@ -41,6 +41,10 @@ every verify step 1.5-2 ms.
 tokens, thinking on. Before = the config we ran until now (same vLLM tree, CPU PLE worker,
 custom all-reduce overlay), 2 loads; after = this, 3 loads.
 
+Both columns had the custom all-reduce overlay (`../vllm-custom-allreduce/`, `CA_MAX_BYTES=8192`)
+loaded. None of the speedup comes from it: on this model, before these changes, it measured flat
+(127.1 t/s with it, 129.5 without, same 21.3 ms step). The final config wasn't run without it.
+
 | | before | after |
 |---|---|---|
 | decode, greedy, median / mean | 166.5 / 160.9 t/s | 222.7 / 217.8 t/s (+34%) |
@@ -125,19 +129,19 @@ differently, so the top-64 exchange will warn and stay off there. Not run on `ma
 
 ## Use
 
-Needs: 8 GPUs with working P2P (`../driver/`), the custom all-reduce overlay
-(`../vllm-custom-allreduce/`), about 48 GB of free host RAM for the pinned n-gram table, and
-`nvcc` for the GDN kernel.
+Needs: 8 GPUs with working P2P (`../driver/`), about 48 GB of free host RAM for the pinned
+n-gram table, and `nvcc` for the GDN kernel. The custom all-reduce overlay is optional (see
+Results).
 
     mkdir -p /opt/vllm-flashnext-fast && cp -r sitecustomize.py fn86_skinny.py configs.json \
         configs_i8.json gdnsplit /opt/vllm-flashnext-fast/
     # build the GDN kernel once with the server's python (about a minute; needs nvcc / CUDA_HOME)
     cd /opt/vllm-flashnext-fast/gdnsplit && python -c "import gdn_split_ext; gdn_split_ext.ext()"
 
-    export PYTHONPATH=/opt/vllm-flashnext-fast:/opt/vllm-force-ca
+    export PYTHONPATH=/opt/vllm-flashnext-fast    # :/opt/vllm-force-ca + CA_MAX_BYTES=8192 to match our runs
     export FN_SKINNY=1 FN_DRAFT_I8=1 FN_TOPK_GATHER=64 FN_GDN_SPLIT=1 FN_ASYNC_H2D=1
     export VLLM_DISABLE_COMPILE_CACHE=1
-    export CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS
+    export NCCL_P2P_LEVEL=SYS
     unset PYTORCH_CUDA_ALLOC_CONF       # no expandable_segments
     vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
         --tensor-parallel-size 8 --enable-expert-parallel \
@@ -155,7 +159,6 @@ The log should show, among others:
     [flashnext-fast] draft int8: <n> linears (...) + lm_head (...)
     [flashnext-fast] GDN MTP decode -> V-split kernel (FN_GDN_SPLIT=1)
     [flashnext-fast] vllm.v1.attention.backends.short_conv_attn: 5 host-to-device copies made async
-    [force-ca] custom all-reduce capped at 8192 bytes
 
 Settings that matter:
 

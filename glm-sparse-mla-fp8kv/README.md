@@ -23,7 +23,10 @@ What the patch does (4 Python/Triton files, no rebuild):
 ## Results
 
 8x RTX 3090, TP8, 210 W, P2P driver, GLM-5.3-Flash AWQ W4A16, single stream, 512 tokens.
-Both runs also used the custom all-reduce overlay (`CA_MAX_BYTES=8192`, no expandable_segments).
+Both runs also used the custom all-reduce overlay (`CA_MAX_BYTES=8192`, no expandable_segments)
+and `NCCL_PROTO=LL128`. Later, without the overlay and with NCCL's default protocol, decode was
+faster: 91.75 vs 87.7 t/s, no spec decoding (see `../vllm-custom-allreduce/`). Don't force
+`NCCL_PROTO=LL128`.
 
 | | bf16 KV, 65,536 window | fp8_e5m2 KV, 159,744 window |
 |---|---|---|
@@ -52,6 +55,9 @@ Then serve from the copy:
     vllm serve <GLM-5.3-Flash AWQ checkpoint> --tensor-parallel-size 8 \
         --kv-cache-dtype fp8_e5m2 --max-model-len 159744 --gpu-memory-utilization 0.97 ...
 
+Take `expandable_segments:True` out of `PYTORCH_CUDA_ALLOC_CONF`. Without the overlay, 159,744
+came up 768 tokens short of fitting here (0.96 vs 0.97 GiB KV per card); 131,072 fits with room
+to spare.
 Tested against backport commit cde54e8; it also applies cleanly to master at 29e66dad4 (not
 run there). Undo: point `PYTHONPATH` back at the unpatched tree.
 

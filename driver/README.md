@@ -78,7 +78,8 @@ NCCL limits P2P to NVLink unless told otherwise. Set this for vLLM and anything 
 
     export NCCL_P2P_LEVEL=SYS
 
-For vLLM on more than two PCIe cards also see `../vllm-custom-allreduce/`.
+`../vllm-custom-allreduce/` is an experiment with vLLM's own all-reduce on more than two PCIe
+cards. It did not beat NCCL defaults here.
 
 ## Numbers (8x RTX 3090, 595.58.03-p2p)
 

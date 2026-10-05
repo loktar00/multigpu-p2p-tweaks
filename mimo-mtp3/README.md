@@ -12,7 +12,8 @@ It also adds `get_top_tokens` so `use_local_argmax_reduction` works.
 ## Results
 
 8x RTX 3090, TP8, 210 W per card, P2P driver, single stream. 8 prompts x 2 runs, 768 tokens,
-temperature 0, median.
+temperature 0, median. The k=3 runs also had the custom all-reduce overlay loaded (see Memory);
+on its own it measured flat on MiMo (199.0 vs 198.0 t/s at k=1).
 
 | | k=1 (stock) | k=3 (this) |
 |---|---|---|
@@ -42,13 +43,17 @@ back to vLLM's chaining, for comparison.
 ## Memory
 
 The extra modules cost KV cache. On 24 GB cards at k=3 the pool dropped to 0.99 GiB per card
-(about 152k tokens), below the 196,608 window we ran at k=1. Two things got it back to 1.24 GiB
-(213-219k tokens): the custom all-reduce overlay with `CA_MAX_BYTES=8192`, and removing
-`expandable_segments:True` from `PYTORCH_CUDA_ALLOC_CONF`. The all-reduce kernel does no work
-here (every message is bigger than 8 KB); with `expandable_segments` off and the overlay loaded,
-vLLM simply ends up with more memory for KV. Stack the overlays:
+(about 152k tokens), below the 196,608 window we ran at k=1. Removing `expandable_segments:True`
+from `PYTORCH_CUDA_ALLOC_CONF` got it back to 1.24 GiB (213-219k tokens):
 
-    PYTHONPATH=/opt/vllm-mimo-mtp3:/opt/vllm-force-ca CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS vllm serve ...
+    unset PYTORCH_CUDA_ALLOC_CONF      # or drop expandable_segments from it
+    PYTHONPATH=/opt/vllm-mimo-mtp3 NCCL_P2P_LEVEL=SYS vllm serve ...
+
+The custom all-reduce overlay (`../vllm-custom-allreduce/`, `CA_MAX_BYTES=8192`) was also
+loaded in those k=3 runs. We don't credit it: it measured no faster on MiMo, and k=3 wasn't run
+without it, so whether the 196,608 window fits without it is untested. If it doesn't, the
+overlay is the thing to try (`PYTHONPATH=/opt/vllm-mimo-mtp3:/opt/vllm-force-ca
+CA_MAX_BYTES=8192`); at k=1 one load without it got 1.31 GiB against 1.51 GiB with it.
 
 262,144 tokens doesn't fit at k=3 on 8x 24 GB (max about 210k).
 

@@ -10,9 +10,10 @@ stands on its own.
 The mimo-mtp3 result as a 45 second film (click the poster to play the mp4).
 
 `vllm-custom-allreduce/` forces vLLM's custom all-reduce on more than two PCIe GPUs when P2P
-works. Single-stream decode on GLM-5.3-Flash TP8 went from 68.5 to 86.5 t/s. With
-`expandable_segments` off it also frees KV memory: bigger context windows on MiMo and
-Qwen3.8-Flash-Next.
+works. Correction (2026-10-05): we said it made GLM-5.3-Flash decode 26% faster and freed KV
+memory. Against NCCL's defaults it was no faster on any model here (GLM: 87.7 t/s with it,
+91.75 without). Kept as an experiment. For KV memory, take `expandable_segments:True` out of
+`PYTORCH_CUDA_ALLOC_CONF` (Flash-Next 2.90 -> 3.68 GiB per card on its own).
 
 `mimo-mtp3/` makes vLLM use all three of MiMo-V2.6-Flash's MTP modules instead of one, fed the
 way SGLang feeds them. Single-stream decode 211 -> 253 t/s on TP8.
@@ -40,28 +41,34 @@ P2P driver: follow `driver/README.md`, then
     nvidia-smi topo -p2p r
     python3 driver/p2p_check.py
 
-vLLM custom all-reduce (needs working P2P between all ranks):
+vLLM on the P2P driver:
 
-    mkdir -p /opt/vllm-force-ca && cp vllm-custom-allreduce/sitecustomize.py /opt/vllm-force-ca/
-    PYTHONPATH=/opt/vllm-force-ca CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS vllm serve <model> --tensor-parallel-size 8
+    export NCCL_P2P_LEVEL=SYS          # or NCCL only uses the NVLink pairs
+    unset PYTORCH_CUDA_ALLOC_CONF      # or drop expandable_segments:True from it; more KV cache
 
-Don't set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` with it.
-
-MiMo-V2.6-Flash with three MTP modules (stacks with the all-reduce overlay):
+MiMo-V2.6-Flash with three MTP modules:
 
     mkdir -p /opt/vllm-mimo-mtp3 && cp mimo-mtp3/sitecustomize.py /opt/vllm-mimo-mtp3/
-    PYTHONPATH=/opt/vllm-mimo-mtp3:/opt/vllm-force-ca CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS \
+    PYTHONPATH=/opt/vllm-mimo-mtp3 NCCL_P2P_LEVEL=SYS \
     vllm serve <MiMo-V2.6-Flash> --tensor-parallel-size 8 \
         --speculative-config '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
 
-Qwen3.8-Flash-Next decode speedups (stacks with the all-reduce overlay; needs the vLLM tree in
-`flashnext-fast/README.md`):
+Qwen3.8-Flash-Next decode speedups (needs the vLLM tree in `flashnext-fast/README.md`):
 
     mkdir -p /opt/vllm-flashnext-fast && cp -r flashnext-fast/{sitecustomize.py,fn86_skinny.py,configs.json,configs_i8.json,gdnsplit} /opt/vllm-flashnext-fast/
-    PYTHONPATH=/opt/vllm-flashnext-fast:/opt/vllm-force-ca CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS     FN_SKINNY=1 FN_DRAFT_I8=1 FN_TOPK_GATHER=64 FN_GDN_SPLIT=1 FN_ASYNC_H2D=1 VLLM_DISABLE_COMPILE_CACHE=1     vllm serve Qwen/Qwen3.8-Flash-Next-FP8 --tensor-parallel-size 8 --enable-expert-parallel         --cpu-offload-gb 6.5 --cpu-offload-params ngram_embedding         --speculative-config '{"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":true}' ...
+    PYTHONPATH=/opt/vllm-flashnext-fast NCCL_P2P_LEVEL=SYS \
+    FN_SKINNY=1 FN_DRAFT_I8=1 FN_TOPK_GATHER=64 FN_GDN_SPLIT=1 FN_ASYNC_H2D=1 VLLM_DISABLE_COMPILE_CACHE=1 \
+    vllm serve Qwen/Qwen3.8-Flash-Next-FP8 --tensor-parallel-size 8 --enable-expert-parallel \
+        --cpu-offload-gb 6.5 --cpu-offload-params ngram_embedding \
+        --speculative-config '{"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":true}' ...
 
 GLM-5.3-Flash fp8 KV on vllm-backport: apply `glm-sparse-mla-fp8kv/fp8kv.patch` to a copy of
 the tree, then serve with `--kv-cache-dtype fp8_e5m2` and `VLLM_INDEXER_PREFILL_BUFFER_FACTOR=8`.
+
+Custom all-reduce overlay (experiment, read `vllm-custom-allreduce/README.md` first):
+
+    mkdir -p /opt/vllm-force-ca && cp vllm-custom-allreduce/sitecustomize.py /opt/vllm-force-ca/
+    PYTHONPATH=/opt/vllm-force-ca CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS vllm serve <model> --tensor-parallel-size 8
 
 Temperature guard (needs [gputemps](https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps)):
 

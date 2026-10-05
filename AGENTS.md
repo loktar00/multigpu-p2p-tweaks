@@ -80,9 +80,15 @@ without errors. Rebuild with `SYSSRC=/lib/modules/<new>/build`, copy into that k
 directory, `depmod -a <new>`, reboot, verify.
 
 Serving: set `NCCL_P2P_LEVEL=SYS` in the environment of vLLM / NCCL jobs, or NCCL only uses
-NVLink pairs.
+NVLink pairs. Leave `NCCL_PROTO` and `NCCL_ALGO` unset unless a measurement says otherwise.
+For more KV cache, remove `expandable_segments:True` from `PYTORCH_CUDA_ALLOC_CONF` and compare
+the KV cache size line in the server log before and after.
 
-## Component 2: vLLM forced custom all-reduce (vllm-custom-allreduce/)
+## Component 2 (optional, experimental): vLLM forced custom all-reduce (vllm-custom-allreduce/)
+
+Not part of the recommended setup. On the test box it did not beat NCCL defaults on
+any model (slower on GLM-5.3-Flash, flat on MiMo-V2.6-Flash and Qwen3.8-Flash-Next). Install it
+only if the owner asks to test it, and judge it against NCCL defaults without the overlay.
 
 What it does: a `sitecustomize.py` that makes vLLM treat PCIe GPUs as fully connected, so its
 custom all-reduce runs at tensor-parallel size > 2. `CA_MAX_BYTES` limits it to small messages.
@@ -117,11 +123,10 @@ Verify:
   `[force-ca] custom all-reduce capped at <n> bytes`.
 - Server log does not contain `Custom allreduce is disabled`.
 - Send the same prompts at temperature 0 with and without the overlay; outputs must match or be
-  equally coherent. Compare single-stream decode t/s and prefill t/s against the old setup;
-  if prefill dropped, lower `CA_MAX_BYTES`. Never raise it to cover speculative-decoding verify
-  steps (16-80 KB): that measured 16-22% slower.
-- Compare the KV cache size line in the server log before and after; with `expandable_segments`
-  off it is usually larger, which allows a larger `--max-model-len`.
+  equally coherent. Compare single-stream decode t/s and prefill t/s against the same server
+  without the overlay, with `expandable_segments` off in both and `NCCL_PROTO` / `NCCL_ALGO`
+  unset in both. If it is not faster, roll it back. Never raise `CA_MAX_BYTES` to cover
+  speculative-decoding verify steps (16-80 KB): that measured 16-22% slower.
 
 Rollback: remove `/opt/vllm-force-ca` from `PYTHONPATH`, unset `CA_MAX_BYTES`, restart the
 server. Optionally add back `--disable-custom-all-reduce`.
@@ -192,8 +197,8 @@ In the server environment put `/opt/vllm-mimo-mtp3` first on `PYTHONPATH` (befor
 
     --speculative-config '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
 
-If the server no longer starts because the KV cache is too small, add component 2 with
-`CA_MAX_BYTES=8192` and remove `expandable_segments:True`; only then lower `--max-model-len`.
+If the server no longer starts because the KV cache is too small, remove `expandable_segments:True`
+from `PYTORCH_CUDA_ALLOC_CONF`; only then lower `--max-model-len`.
 
 Verify:
 
@@ -228,7 +233,9 @@ Install (on a copy; no rebuild needed):
 
 Server changes: `PYTHONPATH` points at the copy, add `--kv-cache-dtype fp8_e5m2` and
 `VLLM_INDEXER_PREFILL_BUFFER_FACTOR=8` (never below 8), then raise `--max-model-len` step by step
-(159,744 fit on 8x 24 GB with component 2 loaded and expandable_segments off).
+(159,744 fit on 8x 24 GB with expandable_segments off and component 2 loaded; without
+component 2 it came up 768 tokens short at `--gpu-memory-utilization 0.97`). Do not set
+`NCCL_PROTO=LL128`: NCCL's default protocol was faster on this model.
 
 Verify:
 
@@ -258,7 +265,7 @@ Prerequisites and checks (same interpreter as the server):
     which nvcc && echo $CUDA_HOME
     free -g                                     # about 48 GB free for the pinned n-gram table
 
-All must match. Component 2 must be installed (`/opt/vllm-force-ca`). The server must already
+All must match. Component 2 is not needed. The server must already
 serve Qwen3.8-Flash-Next FP8 at TP8 on this vLLM. If it does not, build the tree described under
 "vLLM base" in `flashnext-fast/README.md` (PR #53896 at `82399a9fcb` + `vllm-base.patch`) into a
 new venv; never rebuild the venv a running server uses. Note the server's current flags, KV pool
@@ -274,10 +281,10 @@ Install:
 
 Server changes:
 
-    PYTHONPATH=/opt/vllm-flashnext-fast:/opt/vllm-force-ca
+    PYTHONPATH=/opt/vllm-flashnext-fast         # append :/opt/vllm-force-ca only if component 2 is used
     FN_SKINNY=1 FN_DRAFT_I8=1 FN_TOPK_GATHER=64 FN_GDN_SPLIT=1 FN_ASYNC_H2D=1
     VLLM_DISABLE_COMPILE_CACHE=1                # required, the compile cache ignores the overlay
-    CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS
+    NCCL_P2P_LEVEL=SYS
 
 Remove `VLLM_PLE_CPU_OFFLOAD=1` if set and add `--cpu-offload-gb 6.5 --cpu-offload-params
 ngram_embedding`. Add `"use_local_argmax_reduction":true` to `--speculative-config`. Pin the KV
@@ -288,8 +295,7 @@ Verify:
 
 - Log contains `[flashnext-fast] skinny GEMM on`, `[flashnext-fast] draft int8:`,
   `[flashnext-fast] GDN MTP decode -> V-split kernel`, `[flashnext-fast] Qwen4ExpMTP.get_top_tokens
-  added` and `[force-ca] custom all-reduce capped at 8192 bytes`. No `WARNING` lines from
-  `[flashnext-fast]`.
+  added`. No `WARNING` lines from `[flashnext-fast]`.
 - KV pool line in the log matches the before state.
 - Same prompts at temperature 0: answers coherent and equivalent to the before server (greedy
   output on this model already differs between two loads of the same config at near-tie tokens).
