@@ -239,3 +239,64 @@ Verify:
 
 Rollback: point `PYTHONPATH` back at the unpatched tree, drop `--kv-cache-dtype` and the env var,
 restore the old `--max-model-len`, restart.
+
+## Component 6: Qwen3.8-Flash-Next decode speedups (flashnext-fast/)
+
+What it does: a `sitecustomize.py` overlay with tuned Triton decode GEMMs (`FN_SKINNY`), an int8
+MTP drafter (`FN_DRAFT_I8`), a top-64 logits exchange (`FN_TOPK_GATHER`), a split GDN decode
+kernel (`FN_GDN_SPLIT`) and async copies in the short-conv builder (`FN_ASYNC_H2D`), plus a serve
+flag change that keeps the n-gram (PLE) table in pinned host RAM. Measured on 8x RTX 3090, TP8,
+MTP k=4.
+
+Prerequisites and checks (same interpreter as the server):
+
+    V=$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')
+    grep -n "def enable_qwen4_exp_low_latency_gemm" $V/models/qwen4_exp/nvidia/low_latency_gemm.py
+    grep -n "class Qwen4ExpMTP" $V/models/qwen4_exp/nvidia/mtp.py
+    grep -n "def fused_gdn_decode_post_conv_mtp" $V/_custom_ops.py
+    grep -n "cpu_offload_params" $V/config/offload.py
+    which nvcc && echo $CUDA_HOME
+    free -g                                     # about 48 GB free for the pinned n-gram table
+
+All must match. Component 2 must be installed (`/opt/vllm-force-ca`). The server must already
+serve Qwen3.8-Flash-Next FP8 at TP8 on this vLLM. If it does not, build the tree described under
+"vLLM base" in `flashnext-fast/README.md` (PR #53896 at `82399a9fcb` + `vllm-base.patch`) into a
+new venv; never rebuild the venv a running server uses. Note the server's current flags, KV pool
+line and single-stream decode t/s as the before state.
+
+Install:
+
+    mkdir -p /opt/vllm-flashnext-fast
+    cp -r flashnext-fast/sitecustomize.py flashnext-fast/fn86_skinny.py flashnext-fast/configs.json \
+          flashnext-fast/configs_i8.json flashnext-fast/gdnsplit /opt/vllm-flashnext-fast/
+    cd /opt/vllm-flashnext-fast/gdnsplit && python3 -c "import gdn_split_ext; gdn_split_ext.ext()"
+    ls /opt/vllm-flashnext-fast/gdnsplit/build/fn_gdn_split.so
+
+Server changes:
+
+    PYTHONPATH=/opt/vllm-flashnext-fast:/opt/vllm-force-ca
+    FN_SKINNY=1 FN_DRAFT_I8=1 FN_TOPK_GATHER=64 FN_GDN_SPLIT=1 FN_ASYNC_H2D=1
+    VLLM_DISABLE_COMPILE_CACHE=1                # required, the compile cache ignores the overlay
+    CA_MAX_BYTES=8192 NCCL_P2P_LEVEL=SYS
+
+Remove `VLLM_PLE_CPU_OFFLOAD=1` if set and add `--cpu-offload-gb 6.5 --cpu-offload-params
+ngram_embedding`. Add `"use_local_argmax_reduction":true` to `--speculative-config`. Pin the KV
+pool to the before state with `--kv-cache-memory-bytes <bytes>` (3972844748 on 24 GB cards at a
+262,144 window). The full command is in `flashnext-fast/README.md`.
+
+Verify:
+
+- Log contains `[flashnext-fast] skinny GEMM on`, `[flashnext-fast] draft int8:`,
+  `[flashnext-fast] GDN MTP decode -> V-split kernel`, `[flashnext-fast] Qwen4ExpMTP.get_top_tokens
+  added` and `[force-ca] custom all-reduce capped at 8192 bytes`. No `WARNING` lines from
+  `[flashnext-fast]`.
+- KV pool line in the log matches the before state.
+- Same prompts at temperature 0: answers coherent and equivalent to the before server (greedy
+  output on this model already differs between two loads of the same config at near-tie tokens).
+- A needle placed in the middle of a prompt near the maximum length is retrieved.
+- Single-stream decode t/s higher than before. Optional: `FN_TOPK_CHECK=1` logs top-64 mismatch
+  counts every 500 calls; both must stay 0. Turn it off afterwards (it runs the full gather too).
+
+Rollback: remove `/opt/vllm-flashnext-fast` from `PYTHONPATH`, unset the `FN_*` variables and
+`VLLM_DISABLE_COMPILE_CACHE`, restore the previous PLE setting, speculative config and KV flags,
+restart the server.
