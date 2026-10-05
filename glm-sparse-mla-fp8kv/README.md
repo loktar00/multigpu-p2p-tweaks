@@ -58,6 +58,7 @@ Then serve from the copy:
 Take `expandable_segments:True` out of `PYTORCH_CUDA_ALLOC_CONF`. Without the overlay, 159,744
 came up 768 tokens short of fitting here (0.96 vs 0.97 GiB KV per card); 131,072 fits with room
 to spare.
+
 Tested against backport commit cde54e8; it also applies cleanly to master at 29e66dad4 (not
 run there). Undo: point `PYTHONPATH` back at the unpatched tree.
 
